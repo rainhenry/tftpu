@@ -63,6 +63,13 @@ GetLocalFileSize (
 
 STATIC
 EFI_STATUS
+GetFileList (
+  OUT  CHAR16   ***FileList,
+  OUT  UINTN    *FileCount
+  );
+
+STATIC
+EFI_STATUS
 UploadFile (
   IN   EFI_MTFTP4_PROTOCOL  *Mtftp4,
   IN   CONST CHAR16         *LocalFilePath,
@@ -70,6 +77,20 @@ UploadFile (
   IN   UINTN                FileSize,
   IN   UINT16               BlockSize,
   IN   UINT16               WindowSize
+  );
+
+STATIC
+EFI_STATUS
+UploadFileWithNic (
+  IN   EFI_HANDLE           ControllerHandle,
+  IN   EFI_MTFTP4_CONFIG_DATA  *Mtftp4ConfigData,
+  IN   CONST CHAR16         *LocalFilePath,
+  IN   CONST CHAR8          *AsciiRemoteFilePath,
+  IN   UINTN                FileSize,
+  IN   UINT16               BlockSize,
+  IN   UINT16               WindowSize,
+  IN   CONST CHAR16         *UserNicName,
+  OUT  BOOLEAN              *Success
   );
 
 STATIC
@@ -162,11 +183,12 @@ RunTftpu (
   UINTN                   NicNumber;
   CHAR16                  NicName[IP4_CONFIG2_INTERFACE_INFO_NAME_LENGTH];
   EFI_HANDLE              ControllerHandle;
-  EFI_HANDLE              Mtftp4ChildHandle;
-  EFI_MTFTP4_PROTOCOL     *Mtftp4;
   UINTN                   FileSize;
   UINT16                  BlockSize;
   UINT16                  WindowSize;
+  BOOLEAN                 BatchMode;
+  CHAR16                  **FileList;
+  UINTN                   FileCount;
 
   ShellStatus         = SHELL_INVALID_PARAMETER;
   ProblemParam        = NULL;
@@ -176,6 +198,9 @@ RunTftpu (
   FileSize            = 0;
   BlockSize           = MTFTP_DEFAULT_BLKSIZE;
   WindowSize          = MTFTP_DEFAULT_WINDOWSIZE;
+  BatchMode           = FALSE;
+  FileList            = NULL;
+  FileCount           = 0;
 
   Status = ShellInitialize ();
   if (EFI_ERROR (Status)) {
@@ -255,6 +280,10 @@ RunTftpu (
 
   mLocalFilePath = ShellCommandLineGetRawValue (CheckPackage, 1);
 
+  if (StrCmp (mLocalFilePath, L"*") == 0) {
+    BatchMode = TRUE;
+  }
+
   ValueStr = ShellCommandLineGetRawValue (CheckPackage, 2);
   Status   = NetLibStrToIp4 (ValueStr, &Mtftp4ConfigData.ServerIp);
   if (EFI_ERROR (Status)) {
@@ -274,27 +303,8 @@ RunTftpu (
   if (ParamCount == 4) {
     RemoteFilePath = ShellCommandLineGetRawValue (CheckPackage, 3);
   } else {
-    Walker = mLocalFilePath + StrLen (mLocalFilePath);
-    while ((--Walker) >= mLocalFilePath) {
-      if ((*Walker == L'\\') ||
-          (*Walker == L'/'))
-      {
-        break;
-      }
-    }
-
-    RemoteFilePath = Walker + 1;
+    RemoteFilePath = NULL;
   }
-
-  ASSERT (RemoteFilePath != NULL);
-  FilePathSize        = StrLen (RemoteFilePath) + 1;
-  AsciiRemoteFilePath = AllocatePool (FilePathSize);
-  if (AsciiRemoteFilePath == NULL) {
-    ShellStatus = SHELL_OUT_OF_RESOURCES;
-    goto Error;
-  }
-
-  UnicodeStrToAsciiStrS (RemoteFilePath, AsciiRemoteFilePath, FilePathSize);
 
   UserNicName = ShellCommandLineGetValue (CheckPackage, L"-i");
 
@@ -411,106 +421,299 @@ RunTftpu (
     goto Error;
   }
 
-  Status = GetLocalFileSize (mLocalFilePath, &FileSize);
-  if (EFI_ERROR (Status)) {
+  if (BatchMode) {
+    Status = GetFileList (&FileList, &FileCount);
+    if (EFI_ERROR (Status)) {
+      ShellPrintHiiEx (
+        -1,
+        -1,
+        NULL,
+        STRING_TOKEN (STR_TFTPU_ERR_BATCH_LIST),
+        mTftpuHiiHandle,
+        Status
+        );
+      goto Error;
+    }
+
+    if (FileCount == 0) {
+      ShellPrintHiiEx (
+        -1,
+        -1,
+        NULL,
+        STRING_TOKEN (STR_TFTPU_ERR_NO_FILES),
+        mTftpuHiiHandle
+        );
+      goto Error;
+    }
+
     ShellPrintHiiEx (
       -1,
       -1,
       NULL,
-      STRING_TOKEN (STR_TFTPU_ERR_FILE_SIZE),
+      STRING_TOKEN (STR_TFTPU_BATCH_UPLOAD),
       mTftpuHiiHandle,
-      mLocalFilePath,
-      Status
+      FileCount
       );
-    goto Error;
-  }
 
-  for (NicNumber = 0;
-       (NicNumber < HandleCount) && (ShellStatus != SHELL_SUCCESS);
-       NicNumber++)
-  {
-    ControllerHandle = Handles[NicNumber];
+    for (UINTN FileIndex = 0; FileIndex < FileCount; FileIndex++) {
+      CONST CHAR16  *LocalFile;
+      BOOLEAN       Success;
 
-    Status = GetNicName (ControllerHandle, NicNumber, NicName);
-    if (EFI_ERROR (Status)) {
-      ShellPrintHiiEx (
-        -1,
-        -1,
-        NULL,
-        STRING_TOKEN (STR_TFTPU_ERR_NIC_NAME),
-        mTftpuHiiHandle,
-        NicNumber,
-        Status
-        );
-      continue;
-    }
+      LocalFile = FileList[FileIndex];
 
-    if (UserNicName != NULL) {
-      if (StrCmp (NicName, UserNicName) != 0) {
+      Status = GetLocalFileSize (LocalFile, &FileSize);
+      if (EFI_ERROR (Status)) {
+        ShellPrintHiiEx (
+          -1,
+          -1,
+          NULL,
+          STRING_TOKEN (STR_TFTPU_ERR_FILE_SIZE),
+          mTftpuHiiHandle,
+          LocalFile,
+          Status
+          );
         continue;
       }
 
-      NicFound = TRUE;
-    }
+      Walker = LocalFile + StrLen (LocalFile);
+      while ((--Walker) >= LocalFile) {
+        if ((*Walker == L'\\') ||
+            (*Walker == L'/'))
+        {
+          break;
+        }
+      }
 
-    Status = CreateServiceChildAndOpenProtocol (
-               ControllerHandle,
-               &gEfiMtftp4ServiceBindingProtocolGuid,
-               &gEfiMtftp4ProtocolGuid,
-               &Mtftp4ChildHandle,
-               (VOID **)&Mtftp4
-               );
-    if (EFI_ERROR (Status)) {
-      ShellPrintHiiEx (
-        -1,
-        -1,
-        NULL,
-        STRING_TOKEN (STR_TFTPU_ERR_OPEN_PROTOCOL),
-        mTftpuHiiHandle,
-        NicName,
-        Status
-        );
-      continue;
-    }
+      Walker = LocalFile + StrLen (LocalFile);
+      while ((--Walker) >= LocalFile) {
+        if ((*Walker == L'\\') ||
+            (*Walker == L'/'))
+        {
+          break;
+        }
+      }
 
-    Status = Mtftp4->Configure (Mtftp4, &Mtftp4ConfigData);
-    if (EFI_ERROR (Status)) {
-      ShellPrintHiiEx (
-        -1,
-        -1,
-        NULL,
-        STRING_TOKEN (STR_TFTPU_ERR_CONFIGURE),
-        mTftpuHiiHandle,
-        NicName,
-        Status
-        );
-      goto NextHandle;
-    }
+      CONST CHAR16 *FileNameOnly = Walker + 1;
+      CHAR16 *FullRemotePath;
 
-    Status = UploadFile (Mtftp4, mLocalFilePath, AsciiRemoteFilePath, FileSize, BlockSize, WindowSize);
-    if (EFI_ERROR (Status)) {
-      ShellPrintHiiEx (
-        -1,
-        -1,
-        NULL,
-        STRING_TOKEN (STR_TFTPU_ERR_UPLOAD),
-        mTftpuHiiHandle,
-        mLocalFilePath,
-        NicName,
-        Status
-        );
-      goto NextHandle;
+      if (RemoteFilePath != NULL) {
+        UINTN RemoteLen = StrLen (RemoteFilePath);
+        BOOLEAN IsDirectory = (RemoteLen > 0) &&
+                              ((RemoteFilePath[RemoteLen - 1] == L'/') ||
+                               (RemoteFilePath[RemoteLen - 1] == L'\\'));
+
+        if (IsDirectory) {
+          UINTN FullPathSize = RemoteLen + StrLen (FileNameOnly) + 1;
+          FullRemotePath = AllocatePool (FullPathSize * sizeof (CHAR16));
+          if (FullRemotePath == NULL) {
+            ShellStatus = SHELL_OUT_OF_RESOURCES;
+            goto Error;
+          }
+
+          UnicodeSPrint (FullRemotePath, FullPathSize * sizeof (CHAR16), L"%s%s", RemoteFilePath, FileNameOnly);
+        } else {
+          UINTN FullPathSize = StrLen (RemoteFilePath) + 1;
+          FullRemotePath = AllocatePool (FullPathSize * sizeof (CHAR16));
+          if (FullRemotePath == NULL) {
+            ShellStatus = SHELL_OUT_OF_RESOURCES;
+            goto Error;
+          }
+
+          StrCpyS (FullRemotePath, FullPathSize, RemoteFilePath);
+        }
+      } else {
+        UINTN FullPathSize = StrLen (FileNameOnly) + 1;
+        FullRemotePath = AllocatePool (FullPathSize * sizeof (CHAR16));
+        if (FullRemotePath == NULL) {
+          ShellStatus = SHELL_OUT_OF_RESOURCES;
+          goto Error;
+        }
+
+        StrCpyS (FullRemotePath, FullPathSize, FileNameOnly);
+      }
+
+      FilePathSize = StrLen (FullRemotePath) + 1;
+      AsciiRemoteFilePath = AllocatePool (FilePathSize);
+      if (AsciiRemoteFilePath == NULL) {
+        FreePool (FullRemotePath);
+        ShellStatus = SHELL_OUT_OF_RESOURCES;
+        goto Error;
+      }
+
+      UnicodeStrToAsciiStrS (FullRemotePath, AsciiRemoteFilePath, FilePathSize);
+      FreePool (FullRemotePath);
+
+      Success = FALSE;
+      for (NicNumber = 0;
+           (NicNumber < HandleCount) && (!Success);
+           NicNumber++)
+      {
+        ControllerHandle = Handles[NicNumber];
+
+        Status = GetNicName (ControllerHandle, NicNumber, NicName);
+        if (EFI_ERROR (Status)) {
+          continue;
+        }
+
+        if (UserNicName != NULL) {
+          if (StrCmp (NicName, UserNicName) != 0) {
+            continue;
+          }
+
+          NicFound = TRUE;
+        }
+
+        Status = UploadFileWithNic (
+                   ControllerHandle,
+                   &Mtftp4ConfigData,
+                   LocalFile,
+                   AsciiRemoteFilePath,
+                   FileSize,
+                   BlockSize,
+                   WindowSize,
+                   UserNicName,
+                   &Success
+                   );
+      }
+
+      if (!Success) {
+        ShellPrintHiiEx (
+          -1,
+          -1,
+          NULL,
+          STRING_TOKEN (STR_TFTPU_ERR_UPLOAD),
+          mTftpuHiiHandle,
+          LocalFile,
+          NicName,
+          Status
+          );
+      }
+
+      if (AsciiRemoteFilePath != NULL) {
+        FreePool (AsciiRemoteFilePath);
+        AsciiRemoteFilePath = NULL;
+      }
     }
 
     ShellStatus = SHELL_SUCCESS;
+  } else {
+    Walker = mLocalFilePath + StrLen (mLocalFilePath);
+    while ((--Walker) >= mLocalFilePath) {
+      if ((*Walker == L'\\') ||
+          (*Walker == L'/'))
+      {
+        break;
+      }
+    }
 
-NextHandle:
-    CloseProtocolAndDestroyServiceChild (
-      ControllerHandle,
-      &gEfiMtftp4ServiceBindingProtocolGuid,
-      &gEfiMtftp4ProtocolGuid,
-      Mtftp4ChildHandle
-      );
+    CONST CHAR16 *FileNameOnly = Walker + 1;
+    CHAR16 *FullRemotePath;
+
+    if (RemoteFilePath != NULL) {
+      UINTN RemoteLen = StrLen (RemoteFilePath);
+      BOOLEAN IsDirectory = (RemoteLen > 0) &&
+                            ((RemoteFilePath[RemoteLen - 1] == L'/') ||
+                             (RemoteFilePath[RemoteLen - 1] == L'\\'));
+
+      if (IsDirectory) {
+        UINTN FullPathSize = RemoteLen + StrLen (FileNameOnly) + 1;
+        FullRemotePath = AllocatePool (FullPathSize * sizeof (CHAR16));
+        if (FullRemotePath == NULL) {
+          ShellStatus = SHELL_OUT_OF_RESOURCES;
+          goto Error;
+        }
+
+        UnicodeSPrint (FullRemotePath, FullPathSize * sizeof (CHAR16), L"%s%s", RemoteFilePath, FileNameOnly);
+      } else {
+        UINTN FullPathSize = StrLen (RemoteFilePath) + 1;
+        FullRemotePath = AllocatePool (FullPathSize * sizeof (CHAR16));
+        if (FullRemotePath == NULL) {
+          ShellStatus = SHELL_OUT_OF_RESOURCES;
+          goto Error;
+        }
+
+        StrCpyS (FullRemotePath, FullPathSize, RemoteFilePath);
+      }
+    } else {
+      UINTN FullPathSize = StrLen (FileNameOnly) + 1;
+      FullRemotePath = AllocatePool (FullPathSize * sizeof (CHAR16));
+      if (FullRemotePath == NULL) {
+        ShellStatus = SHELL_OUT_OF_RESOURCES;
+        goto Error;
+      }
+
+      StrCpyS (FullRemotePath, FullPathSize, FileNameOnly);
+    }
+
+    FilePathSize = StrLen (FullRemotePath) + 1;
+    AsciiRemoteFilePath = AllocatePool (FilePathSize);
+    if (AsciiRemoteFilePath == NULL) {
+      FreePool (FullRemotePath);
+      ShellStatus = SHELL_OUT_OF_RESOURCES;
+      goto Error;
+    }
+
+    UnicodeStrToAsciiStrS (FullRemotePath, AsciiRemoteFilePath, FilePathSize);
+    FreePool (FullRemotePath);
+
+    Status = GetLocalFileSize (mLocalFilePath, &FileSize);
+    if (EFI_ERROR (Status)) {
+      ShellPrintHiiEx (
+        -1,
+        -1,
+        NULL,
+        STRING_TOKEN (STR_TFTPU_ERR_FILE_SIZE),
+        mTftpuHiiHandle,
+        mLocalFilePath,
+        Status
+        );
+      goto Error;
+    }
+
+    for (NicNumber = 0;
+         (NicNumber < HandleCount) && (ShellStatus != SHELL_SUCCESS);
+         NicNumber++)
+    {
+      ControllerHandle = Handles[NicNumber];
+
+      Status = GetNicName (ControllerHandle, NicNumber, NicName);
+      if (EFI_ERROR (Status)) {
+        ShellPrintHiiEx (
+          -1,
+          -1,
+          NULL,
+          STRING_TOKEN (STR_TFTPU_ERR_NIC_NAME),
+          mTftpuHiiHandle,
+          NicNumber,
+          Status
+          );
+        continue;
+      }
+
+      if (UserNicName != NULL) {
+        if (StrCmp (NicName, UserNicName) != 0) {
+          continue;
+        }
+
+        NicFound = TRUE;
+      }
+
+      BOOLEAN Success = FALSE;
+      Status = UploadFileWithNic (
+                 ControllerHandle,
+                 &Mtftp4ConfigData,
+                 mLocalFilePath,
+                 AsciiRemoteFilePath,
+                 FileSize,
+                 BlockSize,
+                 WindowSize,
+                 UserNicName,
+                 &Success
+                 );
+      if (Success) {
+        ShellStatus = SHELL_SUCCESS;
+      }
+    }
   }
 
   if ((UserNicName != NULL) && (!NicFound)) {
@@ -532,6 +735,16 @@ Error:
 
   if (Handles != NULL) {
     FreePool (Handles);
+  }
+
+  if (FileList != NULL) {
+    for (UINTN i = 0; i < FileCount; i++) {
+      if (FileList[i] != NULL) {
+        FreePool (FileList[i]);
+      }
+    }
+
+    FreePool (FileList);
   }
 
   if ((ShellStatus != SHELL_SUCCESS) && (EFI_ERROR (Status))) {
@@ -721,6 +934,106 @@ GetLocalFileSize (
 
 STATIC
 EFI_STATUS
+GetFileList (
+  OUT  CHAR16   ***FileList,
+  OUT  UINTN    *FileCount
+  )
+{
+  EFI_STATUS           Status;
+  SHELL_FILE_HANDLE    DirHandle;
+  EFI_FILE_INFO        *FileInfo;
+  BOOLEAN              NoFile;
+  CHAR16               **List;
+  UINTN                Count;
+  UINTN                Capacity;
+
+  *FileList  = NULL;
+  *FileCount = 0;
+
+  Status = ShellOpenFileByName (
+             L".",
+             &DirHandle,
+             EFI_FILE_MODE_READ,
+             0
+             );
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Count    = 0;
+  Capacity = 16;
+  List     = AllocatePool (Capacity * sizeof (CHAR16 *));
+  if (List == NULL) {
+    Status = EFI_OUT_OF_RESOURCES;
+    goto Error;
+  }
+
+  NoFile = FALSE;
+  Status = ShellFindFirstFile (DirHandle, &FileInfo);
+  if (EFI_ERROR (Status)) {
+    goto Error;
+  }
+
+  while (!NoFile) {
+    if ((FileInfo->Attribute & EFI_FILE_DIRECTORY) == 0) {
+      if (Count >= Capacity) {
+        CHAR16 **NewList;
+
+        Capacity *= 2;
+        NewList = ReallocatePool (
+                    (Count * sizeof (CHAR16 *)),
+                    (Capacity * sizeof (CHAR16 *)),
+                    List
+                    );
+        if (NewList == NULL) {
+          Status = EFI_OUT_OF_RESOURCES;
+          break;
+        }
+
+        List = NewList;
+      }
+
+      List[Count] = AllocateCopyPool (
+                      (StrLen (FileInfo->FileName) + 1) * sizeof (CHAR16),
+                      FileInfo->FileName
+                      );
+      if (List[Count] == NULL) {
+        Status = EFI_OUT_OF_RESOURCES;
+        break;
+      }
+
+      Count++;
+    }
+
+    Status = ShellFindNextFile (DirHandle, FileInfo, &NoFile);
+    if (EFI_ERROR (Status)) {
+      break;
+    }
+  }
+
+  if (!EFI_ERROR (Status)) {
+    *FileList  = List;
+    *FileCount = Count;
+    List       = NULL;
+  }
+
+Error:
+  if (List != NULL) {
+    for (UINTN i = 0; i < Count; i++) {
+      if (List[i] != NULL) {
+        FreePool (List[i]);
+      }
+    }
+
+    FreePool (List);
+  }
+
+  ShellCloseFile (&DirHandle);
+  return Status;
+}
+
+STATIC
+EFI_STATUS
 UploadFile (
   IN   EFI_MTFTP4_PROTOCOL  *Mtftp4,
   IN   CONST CHAR16         *LocalFilePath,
@@ -820,6 +1133,75 @@ Error:
   if (Mtftp4Token.OptionList != NULL) {
     FreePool (Mtftp4Token.OptionList);
   }
+
+  return Status;
+}
+
+STATIC
+EFI_STATUS
+UploadFileWithNic (
+  IN   EFI_HANDLE              ControllerHandle,
+  IN   EFI_MTFTP4_CONFIG_DATA  *Mtftp4ConfigData,
+  IN   CONST CHAR16            *LocalFilePath,
+  IN   CONST CHAR8             *AsciiRemoteFilePath,
+  IN   UINTN                   FileSize,
+  IN   UINT16                  BlockSize,
+  IN   UINT16                  WindowSize,
+  IN   CONST CHAR16            *UserNicName,
+  OUT  BOOLEAN                 *Success
+  )
+{
+  EFI_STATUS        Status;
+  EFI_HANDLE        Mtftp4ChildHandle;
+  EFI_MTFTP4_PROTOCOL *Mtftp4;
+  CHAR16            NicName[IP4_CONFIG2_INTERFACE_INFO_NAME_LENGTH];
+
+  *Success = FALSE;
+
+  Status = GetNicName (ControllerHandle, 0, NicName);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  if (UserNicName != NULL) {
+    if (StrCmp (NicName, UserNicName) != 0) {
+      return EFI_NOT_FOUND;
+    }
+  }
+
+  Status = CreateServiceChildAndOpenProtocol (
+             ControllerHandle,
+             &gEfiMtftp4ServiceBindingProtocolGuid,
+             &gEfiMtftp4ProtocolGuid,
+             &Mtftp4ChildHandle,
+             (VOID **)&Mtftp4
+             );
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Status = Mtftp4->Configure (Mtftp4, Mtftp4ConfigData);
+  if (EFI_ERROR (Status)) {
+    CloseProtocolAndDestroyServiceChild (
+      ControllerHandle,
+      &gEfiMtftp4ServiceBindingProtocolGuid,
+      &gEfiMtftp4ProtocolGuid,
+      Mtftp4ChildHandle
+      );
+    return Status;
+  }
+
+  Status = UploadFile (Mtftp4, LocalFilePath, AsciiRemoteFilePath, FileSize, BlockSize, WindowSize);
+  if (!EFI_ERROR (Status)) {
+    *Success = TRUE;
+  }
+
+  CloseProtocolAndDestroyServiceChild (
+    ControllerHandle,
+    &gEfiMtftp4ServiceBindingProtocolGuid,
+    &gEfiMtftp4ProtocolGuid,
+    Mtftp4ChildHandle
+    );
 
   return Status;
 }

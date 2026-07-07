@@ -7,6 +7,7 @@ This package provides a standalone UEFI application that allows uploading files 
 ## Features
 
 - Upload files from UEFI environment to TFTP server
+- Batch upload all files in current directory using `*` wildcard
 - Supports all standard TFTP options (blksize, windowsize, retry count, timeout)
 - Supports specifying network interface, local/remote ports
 - Help information via `-h`, `-?`, and `--help` options
@@ -97,15 +98,21 @@ tftpu [-i interface] [-l <port>] [-r <port>] [-c <retry count>] [-t <timeout>]
 | `-t <timeout>` | Timeout in seconds (default: 4) |
 | `-s <block size>` | TFTP blksize option (8-65464, default: 512) |
 | `-w <window size>` | TFTP windowsize option (1-64, default: 1) |
-| `localfilepath` | Local source file path to upload |
+| `localfilepath` | Local source file path to upload. Use `*` to upload all files in current directory |
 | `host` | TFTP Server IPv4 address |
-| `remotefilepath` | Optional: destination file path on server |
+| `remotefilepath` | Optional: destination file path on server. If it ends with `/` or `\`, it's treated as a directory and the file will be uploaded with its original name to that directory |
 
 ### Examples
 
 ```bash
+# Upload all files in current directory to server 192.168.1.1
+fs0:\> tftpu * 192.168.1.1
+
 # Upload file.bin to server 192.168.1.1 using local filename
 fs0:\> tftpu file.bin 192.168.1.1
+
+# Upload file.bin to server 192.168.1.1, store in directory uploads/
+fs0:\> tftpu file.bin 192.168.1.1 uploads/
 
 # Upload file2.dat to server 192.168.1.1, store as dir1/file1.dat
 fs0:\> tftpu file2.dat 192.168.1.1 dir1/file1.dat
